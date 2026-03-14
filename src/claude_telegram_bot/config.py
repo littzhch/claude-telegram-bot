@@ -142,13 +142,13 @@ def get_config() -> dict:
 
     config["claude_timeout"] = (
         args.claude_timeout
-        or int(os.getenv("CLAUDE_TIMEOUT", ""))
+        or int(os.getenv("CLAUDE_TIMEOUT") or 0)
         or file_config.get("claude", {}).get("timeout", 120)
     )
 
     config["max_history_messages"] = (
         args.max_history_messages
-        or int(os.getenv("MAX_HISTORY_MESSAGES", ""))
+        or int(os.getenv("MAX_HISTORY_MESSAGES") or 0)
         or file_config.get("claude", {}).get("max_history_messages", 40)
     )
 
