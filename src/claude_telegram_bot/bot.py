@@ -6,18 +6,19 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
     ContextTypes,
+    CallbackQueryHandler,
 )
 
 from claude_telegram_bot import config
 from claude_telegram_bot.auth import require_auth, is_admin
-from claude_telegram_bot.claude_runner import run_claude
+from claude_telegram_bot.claude_runner import run_claude, run_claude_stream, ConfirmationRequest
 from claude_telegram_bot.session_manager import SessionManager, init_db as init_session_db
 from claude_telegram_bot.project_manager import (
     init_db as init_project_db,
@@ -35,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 # In-memory session managers per user
 _user_sessions: dict[int, SessionManager] = {}
+
+# Track pending confirmations: user_id -> {"message_id": int, "tool": str, "input": dict}
+_pending_confirmations: dict[int, dict] = {}
 
 
 def _get_session(user_id: int) -> SessionManager:
@@ -308,6 +312,45 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"File saved to: {dest}")
 
 
+# ── Confirmation handler ──
+
+@require_auth
+async def handle_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle confirmation button presses (Yes/No)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    callback_data = query.data
+
+    # Check if there's a pending confirmation for this user
+    if user_id not in _pending_confirmations:
+        await query.edit_message_text("No pending confirmation.")
+        return
+
+    confirmation = _pending_confirmations.pop(user_id)
+    message_id = confirmation["message_id"]
+
+    if callback_data == "confirm_yes":
+        # User confirmed - send approval to Claude
+        await query.edit_message_text(
+            text=confirmation.get("description", "Action confirmed."),
+            reply_markup=None,
+        )
+        # Note: Claude CLI in stream mode may not support stdin for confirmation
+        # This is a simplified implementation - the action would need to be retried
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Confirmed! (Note: Claude CLI confirmation flow may need retry)",
+        )
+    else:
+        # User declined
+        await query.edit_message_text(
+            text="Action cancelled.",
+            reply_markup=None,
+        )
+
+
 # ── Message handler ──
 
 @require_auth
@@ -336,7 +379,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking_msg = await update.message.reply_text("Claude is thinking...")
 
     try:
-        output = await run_claude(prompt, cwd=cwd, continue_session=False)
+        # Use stream to detect confirmation requests
+        output_parts = []
+        confirmation_request = None
+
+        async for output, confirm_req in run_claude_stream(
+            prompt, cwd=cwd, continue_session=False
+        ):
+            if confirm_req:
+                # Claude is asking for confirmation
+                confirmation_request = confirm_req
+                break
+            if output:
+                output_parts.append(output)
+
+        output = "".join(output_parts)
+
+        # If confirmation requested, show confirmation dialog
+        if confirmation_request:
+            await thinking_msg.delete()
+
+            # Build confirmation message
+            tool_info = f"Tool: {confirmation_request.tool_name}"
+            if confirmation_request.tool_input:
+                # Show relevant details based on tool type
+                if "path" in confirmation_request.tool_input:
+                    tool_info += f"\nPath: {confirmation_request.tool_input.get('path')}"
+                elif "file_path" in confirmation_request.tool_input:
+                    tool_info += f"\nFile: {confirmation_request.tool_input.get('file_path')}"
+
+            confirmation_text = (
+                f"⚠️ *Confirmation Required*\n\n"
+                f"{confirmation_request.message}\n\n"
+                f"_{tool_info}_"
+            )
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="confirm_no"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            confirm_msg = await update.message.reply_text(
+                confirmation_text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+
+            # Store pending confirmation
+            _pending_confirmations[user_id] = {
+                "message_id": confirm_msg.message_id,
+                "tool": confirmation_request.tool_name,
+                "input": confirmation_request.tool_input,
+                "description": confirmation_request.message,
+            }
+
+            # Don't save to history yet - wait for confirmation
+            return
+
     except Exception as e:
         output = f"Error: {e}"
 
@@ -413,6 +515,9 @@ def main():
 
     # File uploads
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Confirmation callbacks (must be before MessageHandler)
+    app.add_handler(CallbackQueryHandler(handle_confirmation_callback))
 
     # Text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

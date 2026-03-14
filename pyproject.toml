@@ -1,6 +1,6 @@
 [project]
 name = "claude-telegram-bot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Telegram bot for interacting with Claude Code CLI"
 readme = "README.md"
 requires-python = ">=3.9"

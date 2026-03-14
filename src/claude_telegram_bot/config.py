@@ -137,7 +137,7 @@ def get_config() -> dict:
     config["claude_path"] = (
         args.claude_path
         or os.getenv("CLAUDE_PATH")
-        or file_config.get("claude", {}).get("path", "/home/zhangchi/.local/bin/claude")
+        or file_config.get("claude", {}).get("path", "claude")
     )
 
     config["claude_timeout"] = (

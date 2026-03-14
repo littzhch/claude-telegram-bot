@@ -1,10 +1,21 @@
 import asyncio
+import json
 import logging
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Generator
 
 from claude_telegram_bot import config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ConfirmationRequest:
+    """Represents a confirmation request from Claude."""
+    message: str
+    tool_name: str
+    tool_input: dict
 
 
 async def run_claude(
@@ -69,8 +80,13 @@ async def run_claude_stream(
     continue_session: bool = True,
     allowed_tools: list[str] | None = None,
     timeout: int | None = None,
-):
-    """Yield chunks of output from Claude Code CLI (line by line)."""
+) -> Generator[tuple[str, ConfirmationRequest | None], None, None]:
+    """Yield (output, confirmation_request) tuples from Claude Code CLI.
+
+    Yields:
+        tuples of (output_chunk, confirmation_request)
+        confirmation_request is None unless Claude is asking for confirmation
+    """
     timeout = timeout or config.CLAUDE_TIMEOUT
     cmd = [config.CLAUDE_PATH, "--print", "--output-format", "stream-json"]
 
@@ -93,7 +109,33 @@ async def run_claude_stream(
 
     try:
         async for line in proc.stdout:
-            yield line.decode(errors="replace").strip()
+            line = line.decode(errors="replace").strip()
+            if not line:
+                continue
+
+            # Try to parse as JSON
+            try:
+                data = json.loads(line)
+                # Check for confirmation request
+                if data.get("type") == "confirm":
+                    confirmation = ConfirmationRequest(
+                        message=data.get("message", "Please confirm this action"),
+                        tool_name=data.get("confirmation", {}).get("type", "unknown"),
+                        tool_input=data.get("confirmation", {}).get("input", {}),
+                    )
+                    yield ("", confirmation)
+                else:
+                    # Regular output
+                    content = data.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if item.get("type") == "text":
+                                yield (item.get("text", ""), None)
+                    elif content:
+                        yield (str(content), None)
+            except json.JSONDecodeError:
+                # Not JSON, yield as-is
+                yield (line, None)
     except asyncio.TimeoutError:
         proc.kill()
 
