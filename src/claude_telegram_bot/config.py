@@ -27,6 +27,27 @@ def load_toml_config(config_path: Path) -> dict:
         return tomllib.load(f)
 
 
+def get_version() -> str:
+    """Get version from installed package, falling back to pyproject.toml for development."""
+    try:
+        from importlib.metadata import version
+        return version("claude-telegram-bot")
+    except Exception:
+        # Fallback for development: read from pyproject.toml
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        pyproject = Path(__file__).parents[2] / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                with open(pyproject, "rb") as f:
+                    return tomllib.load(f).get("project", {}).get("version", "0.0.0")
+            except Exception:
+                pass
+        return "0.0.0"
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -86,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--version", "-v",
         action="version",
-        version="%(prog)s 1.0.0",
+        version=f"%(prog)s {get_version()}",
     )
 
     return parser.parse_args()
