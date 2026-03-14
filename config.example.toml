@@ -1,0 +1,16 @@
+# Claude Telegram Bot Configuration
+# Save this to ~/.config/claude-tg-bot.toml
+
+[telegram]
+bot_token = "your-telegram-bot-token"
+admin_user_id = 123456789
+allowed_user_ids = [123456789, 987654321]
+
+[claude]
+path = "/home/zhangchi/.local/bin/claude"
+timeout = 120
+max_history_messages = 40
+
+[data]
+# Directory for storing bot data (default: ~/.cache/claude-tg-bot/)
+# dir = "/custom/path/to/data"

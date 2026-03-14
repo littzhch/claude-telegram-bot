@@ -6,6 +6,7 @@ requires-python = ">=3.9"
 dependencies = [
     "python-telegram-bot>=21.0",
     "python-dotenv>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]
