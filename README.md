@@ -1,6 +1,6 @@
 # Claude Telegram Bot
 
-Telegram bot for interacting with Claude Code CLI
+Telegram bot for interacting with Claude Code via Claude Agent SDK
 
 ## Installation
 
@@ -23,19 +23,19 @@ admin_user_id = 123456789
 allowed_user_ids = [123456789]
 
 [claude]
-path = "/home/zhangchi/.local/bin/claude"
 timeout = 120
 
 [data]
 dir = "~/.cache/claude-tg-bot"
 ```
 
+Note: The `claude.path` config is no longer needed - the SDK automatically bundles Claude Code CLI.
+
 ### Environment Variables
 
 - `BOT_TOKEN`: Telegram bot token
 - `ADMIN_USER_ID`: Admin user ID
 - `ALLOWED_USER_IDS`: Comma-separated user IDs
-- `CLAUDE_PATH`: Path to Claude CLI
 - `CLAUDE_TIMEOUT`: Command timeout in seconds
 - `DATA_DIR`: Data directory
 

@@ -18,7 +18,8 @@ from telegram.ext import (
 
 from claude_telegram_bot import config
 from claude_telegram_bot.auth import require_auth, is_admin
-from claude_telegram_bot.claude_runner import run_claude, run_claude_stream, ConfirmationRequest
+from claude_telegram_bot.claude_runner import run_claude, get_permission_manager
+from claude_telegram_bot.permission_manager import PermissionManager
 from claude_telegram_bot.session_manager import SessionManager, init_db as init_session_db
 from claude_telegram_bot.project_manager import (
     init_db as init_project_db,
@@ -30,12 +31,15 @@ from claude_telegram_bot.project_manager import (
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,
 )
 logger = logging.getLogger(__name__)
 
 # In-memory session managers per user
 _user_sessions: dict[int, SessionManager] = {}
+
+# Global permission manager for tool access control
+_permission_manager = PermissionManager()
 
 # Track pending confirmations: user_id -> {"message_id": int, "tool": str, "input": dict}
 _pending_confirmations: dict[int, dict] = {}
@@ -316,37 +320,46 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def handle_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle confirmation button presses (Yes/No)."""
+    """Handle confirmation button presses (Yes/No) for tool permissions."""
     query = update.callback_query
-    await query.answer()
+    await query.answer()  # Close the loading indicator
 
     user_id = update.effective_user.id
     callback_data = query.data
+    logger.info(f"Callback received from {user_id}: {callback_data}")
 
-    # Check if there's a pending confirmation for this user
-    if user_id not in _pending_confirmations:
+    # Check if there's a pending confirmation in the permission manager
+    if not _permission_manager.has_pending():
         await query.edit_message_text("No pending confirmation.")
         return
 
-    confirmation = _pending_confirmations.pop(user_id)
-    message_id = confirmation["message_id"]
+    # Get the pending confirmation details
+    pending = _permission_manager.get_pending_confirmation()
+    if pending is None:
+        await query.edit_message_text("No pending confirmation.")
+        return
+
+    pending_user_id, tool_name, tool_input = pending
+
+    # Check if the user clicking is the same user who initiated the request
+    if pending_user_id != user_id:
+        await query.edit_message_text("This confirmation is not for you.")
+        return
 
     if callback_data == "confirm_yes":
-        # User confirmed - send approval to Claude
+        # User confirmed - allow the tool to run
+        _permission_manager.confirm()
+        logger.info(f"User {user_id} confirmed tool: {tool_name}")
         await query.edit_message_text(
-            text=confirmation.get("description", "Action confirmed."),
+            text=f"✅ Tool '{tool_name}' approved!\n\nInput: {str(tool_input)[:200]}",
             reply_markup=None,
         )
-        # Note: Claude CLI in stream mode may not support stdin for confirmation
-        # This is a simplified implementation - the action would need to be retried
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="Confirmed! (Note: Claude CLI confirmation flow may need retry)",
-        )
     else:
-        # User declined
+        # User denied
+        _permission_manager.deny()
+        logger.info(f"User {user_id} denied tool: {tool_name}")
         await query.edit_message_text(
-            text="Action cancelled.",
+            text=f"❌ Tool '{tool_name}' denied.",
             reply_markup=None,
         )
 
@@ -378,69 +391,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send "thinking" indicator
     thinking_msg = await update.message.reply_text("Claude is thinking...")
 
+    # Set the current user as the one waiting for permission
+    _permission_manager.set_waiting_user(user_id)
+    logger.info(f"User {user_id} waiting for permission")
+
     try:
-        # Use stream to detect confirmation requests
-        output_parts = []
-        confirmation_request = None
-
-        async for output, confirm_req in run_claude_stream(
-            prompt, cwd=cwd, continue_session=False
-        ):
-            if confirm_req:
-                # Claude is asking for confirmation
-                confirmation_request = confirm_req
-                break
-            if output:
-                output_parts.append(output)
-
-        output = "".join(output_parts)
-
-        # If confirmation requested, show confirmation dialog
-        if confirmation_request:
-            await thinking_msg.delete()
-
-            # Build confirmation message
-            tool_info = f"Tool: {confirmation_request.tool_name}"
-            if confirmation_request.tool_input:
-                # Show relevant details based on tool type
-                if "path" in confirmation_request.tool_input:
-                    tool_info += f"\nPath: {confirmation_request.tool_input.get('path')}"
-                elif "file_path" in confirmation_request.tool_input:
-                    tool_info += f"\nFile: {confirmation_request.tool_input.get('file_path')}"
-
-            confirmation_text = (
-                f"⚠️ *Confirmation Required*\n\n"
-                f"{confirmation_request.message}\n\n"
-                f"_{tool_info}_"
-            )
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="confirm_no"),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            confirm_msg = await update.message.reply_text(
-                confirmation_text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
-
-            # Store pending confirmation
-            _pending_confirmations[user_id] = {
-                "message_id": confirm_msg.message_id,
-                "tool": confirmation_request.tool_name,
-                "input": confirmation_request.tool_input,
-                "description": confirmation_request.message,
-            }
-
-            # Don't save to history yet - wait for confirmation
-            return
+        # Call Claude via SDK with permission manager
+        output = await run_claude(
+            prompt, cwd=cwd, continue_session=False,
+            permission_manager=_permission_manager
+        )
 
     except Exception as e:
         output = f"Error: {e}"
+    finally:
+        # Clear the waiting user
+        _permission_manager.clear_waiting_user()
 
     # Save assistant response
     sm.add_message("assistant", output)
@@ -470,6 +436,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     """Set bot commands for the Telegram UI."""
+    # Set the telegram bot instance for permission manager
+    _permission_manager.set_telegram_bot(app.bot)
+
     commands = [
         BotCommand("start", "Start using the bot"),
         BotCommand("help", "Show help"),

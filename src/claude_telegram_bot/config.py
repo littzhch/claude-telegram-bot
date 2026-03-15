@@ -72,12 +72,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated list of allowed user IDs",
     )
 
-    # Claude options
-    parser.add_argument(
-        "--claude-path",
-        type=str,
-        help="Path to Claude CLI executable",
-    )
+    # Claude options (using SDK - no need for custom path)
     parser.add_argument(
         "--claude-timeout",
         type=int,
@@ -154,12 +149,9 @@ def get_config() -> dict:
         if uid.strip()
     ]
 
-    # Claude settings
-    config["claude_path"] = (
-        args.claude_path
-        or os.getenv("CLAUDE_PATH")
-        or file_config.get("claude", {}).get("path", "claude")
-    )
+    # Claude settings (using SDK - no need for custom path)
+    # The SDK automatically bundles Claude Code CLI
+    config["claude_path"] = None  # Deprecated - SDK handles CLI internally
 
     config["claude_timeout"] = (
         args.claude_timeout

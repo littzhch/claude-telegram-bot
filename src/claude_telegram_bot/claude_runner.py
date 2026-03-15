@@ -1,11 +1,20 @@
+"""Claude Runner using Claude Agent SDK."""
+
 import asyncio
-import json
 import logging
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Generator
+from typing import AsyncIterable
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+)
 
 from claude_telegram_bot import config
+from claude_telegram_bot.permission_manager import PermissionManager
 
 logger = logging.getLogger(__name__)
 
@@ -18,59 +27,78 @@ class ConfirmationRequest:
     tool_input: dict
 
 
+# Global permission manager instance
+_permission_manager: PermissionManager | None = None
+
+
+def get_permission_manager() -> PermissionManager:
+    """Get or create the global permission manager."""
+    global _permission_manager
+    if _permission_manager is None:
+        _permission_manager = PermissionManager()
+    return _permission_manager
+
+
+def set_permission_manager(manager: PermissionManager):
+    """Set the global permission manager (for testing)."""
+    global _permission_manager
+    _permission_manager = manager
+
+
 async def run_claude(
     prompt: str,
     cwd: str | None = None,
     continue_session: bool = True,
     allowed_tools: list[str] | None = None,
     timeout: int | None = None,
+    permission_manager: PermissionManager | None = None,
 ) -> str:
-    """Call the Claude Code CLI and return its output.
+    """Call the Claude Agent SDK and return its output.
 
     Args:
         prompt: The prompt to send.
-        cwd: Working directory for the CLI process.
-        continue_session: Whether to continue the last conversation (-c flag).
+        cwd: Working directory for the Claude process.
+        continue_session: Whether to continue the last conversation (handled by SDK).
         allowed_tools: Tools to allow (e.g. ["Bash", "Read"]).
-        timeout: Override timeout in seconds.
+        timeout: Not directly used - SDK handles its own timeout.
+        permission_manager: Optional permission manager for tool access control.
     """
-    timeout = timeout or config.CLAUDE_TIMEOUT
-    cmd = [config.CLAUDE_PATH, "--print"]
+    # Use provided permission manager or get global one
+    pm = permission_manager or get_permission_manager()
 
-    if continue_session:
-        cmd.append("-c")
+    options = ClaudeAgentOptions(
+        cwd=cwd,
+        max_turns=100,
+    )
 
     if allowed_tools:
-        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+        options.allowed_tools = allowed_tools
 
-    cmd.append(prompt)
+    # Set permission mode to ensure callbacks are invoked
+    options.permission_mode = "default"
+    # Set permission callback - requires streaming mode
+    options.can_use_tool = pm.check_permission
 
-    cwd = cwd or str(Path.home())
-
-    logger.debug("Running: %s (cwd=%s)", cmd, cwd)
+    output_parts = []
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return f"Claude CLI timed out after {timeout}s."
+        # Use ClaudeSDKClient with streaming mode (required for can_use_tool)
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
 
-    output = stdout.decode(errors="replace").strip()
-    err = stderr.decode(errors="replace").strip()
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            output_parts.append(block.text)
+                elif isinstance(message, ResultMessage):
+                    # End of conversation
+                    break
+    except Exception as e:
+        logger.error(f"Claude SDK error: {e}")
+        return f"Claude SDK error: {e}"
 
-    if proc.returncode != 0 and not output:
-        return f"Claude CLI failed (exit {proc.returncode}):\n{err[:500]}"
-
-    if err and not output:
-        return f"Claude CLI error:\n{err[:500]}"
-
+    output = "".join(output_parts)
     return output if output else "(no output)"
 
 
@@ -80,63 +108,47 @@ async def run_claude_stream(
     continue_session: bool = True,
     allowed_tools: list[str] | None = None,
     timeout: int | None = None,
-) -> Generator[tuple[str, ConfirmationRequest | None], None, None]:
-    """Yield (output, confirmation_request) tuples from Claude Code CLI.
+    permission_manager: PermissionManager | None = None,
+) -> AsyncIterable[tuple[str, ConfirmationRequest | None]]:
+    """Yield (output, confirmation_request) tuples from Claude Agent SDK.
+
+    Note: The SDK uses permission system instead of confirmation requests.
+    This implementation returns (output, None) tuples since permission
+    handling is done via the permission_manager callback.
 
     Yields:
         tuples of (output_chunk, confirmation_request)
-        confirmation_request is None unless Claude is asking for confirmation
+        confirmation_request is always None in this implementation
     """
-    timeout = timeout or config.CLAUDE_TIMEOUT
-    cmd = [config.CLAUDE_PATH, "--print", "--output-format", "stream-json"]
+    # Use provided permission manager or get global one
+    pm = permission_manager or get_permission_manager()
 
-    if continue_session:
-        cmd.append("-c")
-
-    if allowed_tools:
-        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
-
-    cmd.append(prompt)
-
-    cwd = cwd or str(Path.home())
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    options = ClaudeAgentOptions(
         cwd=cwd,
+        max_turns=100,
     )
 
+    if allowed_tools:
+        options.allowed_tools = allowed_tools
+
+    # Set permission mode to ensure callbacks are invoked
+    options.permission_mode = "default"
+    # Set permission callback - requires streaming mode
+    options.can_use_tool = pm.check_permission
+
     try:
-        async for line in proc.stdout:
-            line = line.decode(errors="replace").strip()
-            if not line:
-                continue
+        # Use ClaudeSDKClient with streaming mode
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
 
-            # Try to parse as JSON
-            try:
-                data = json.loads(line)
-                # Check for confirmation request
-                if data.get("type") == "confirm":
-                    confirmation = ConfirmationRequest(
-                        message=data.get("message", "Please confirm this action"),
-                        tool_name=data.get("confirmation", {}).get("type", "unknown"),
-                        tool_input=data.get("confirmation", {}).get("input", {}),
-                    )
-                    yield ("", confirmation)
-                else:
-                    # Regular output
-                    content = data.get("content", "")
-                    if isinstance(content, list):
-                        for item in content:
-                            if item.get("type") == "text":
-                                yield (item.get("text", ""), None)
-                    elif content:
-                        yield (str(content), None)
-            except json.JSONDecodeError:
-                # Not JSON, yield as-is
-                yield (line, None)
-    except asyncio.TimeoutError:
-        proc.kill()
-
-    await proc.wait()
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            yield (block.text, None)
+                elif isinstance(message, ResultMessage):
+                    # End of conversation
+                    break
+    except Exception as e:
+        logger.error(f"Claude SDK error: {e}")
+        yield (f"Claude SDK error: {e}", None)
